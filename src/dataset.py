@@ -39,7 +39,8 @@ def create_dataloaders(
     saved_splits,
     root_dir,
     batch_size=32,
-    num_workers=2
+    num_workers=2,
+    augment=True
 ):
     # One mapping shared by all three datasets
     class_names = sorted(
@@ -56,7 +57,7 @@ def create_dataloaders(
             saved_splits["Training"],
             root_dir,
             class_to_idx,
-            transform=get_train_transform()
+            transform=get_train_transform() if augment else get_eval_transform()
         ),
 
         "Validation": MedicineDataset(
