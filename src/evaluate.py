@@ -18,14 +18,36 @@ from sklearn.metrics import (
 from src.models import build_model
 
 
-def load_model(checkpoint_path, device="cuda"):
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+def load_model(checkpoint_path, device=None):
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False
+    )
+
     config = checkpoint["config"]
 
-    model = build_model(config["model"], len(checkpoint["class_to_idx"]),
-                        dropout=config["dropout"], **config["model_kwargs"])
+    model_kwargs = config["model_kwargs"].copy()
+
+    # Avoid downloading pretrained ImageNet weights again
+    if config["model"] == "transfer":
+        model_kwargs["pretrained"] = False
+
+    model = build_model(
+        config["model"],
+        len(checkpoint["class_to_idx"]),
+        dropout=config["dropout"],
+        **model_kwargs
+    )
+
     model.load_state_dict(checkpoint["model_state"])
-    model.to(device).eval()
+
+    model = model.to(device)
+    model.eval()
 
     return model, checkpoint
 
