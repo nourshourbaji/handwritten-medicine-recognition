@@ -6,25 +6,29 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 from src.dataset import create_dataloaders
-from src.models import build_model, count_parameters
+from src.models import build_model, count_parameters, init_weights
 
 
 # Every experiment starts from these settings and changes only a few of them
 DEFAULT_CONFIG = {
     "model": "cnn",
     "model_kwargs": {},
+    "init": None,
     "dropout": 0.0,
     "loss": "cross_entropy",
     "optimizer": "adam",
     "lr": 1e-3,
     "weight_decay": 0.0,
+    "l1": 0.0,
     "scheduler": None,
     "epochs": 20,
     "batch_size": 32,
     "augment": True,
+    "normalize": None,
     "patience": None,
     "seed": 42,
 }
@@ -37,13 +41,23 @@ def set_seed(seed=42):
     torch.cuda.manual_seed_all(seed)
 
 
+class MSELoss(nn.Module):
+    """Squared error between the softmax probabilities and the one-hot target:
+    sum over classes of (target - output)^2, like in the CNN training slides."""
+
+    def forward(self, outputs, labels):
+        probs = torch.softmax(outputs, dim=1)
+        targets = F.one_hot(labels, probs.shape[1]).float()
+        return ((targets - probs) ** 2).sum(dim=1).mean()
+
+
 def get_criterion(name):
     losses = {
+        # nn.CrossEntropyLoss applies softmax itself, so the model outputs raw scores
         "cross_entropy": nn.CrossEntropyLoss(),
-        # softens the one-hot targets: 0.9 for the true class, rest shared
+        # softens the one-hot targets: 0.9 for the true class, rest shared (noise injection)
         "label_smoothing": nn.CrossEntropyLoss(label_smoothing=0.1),
-        # multi-class hinge loss (the SVM loss)
-        "multi_margin": nn.MultiMarginLoss(),
+        "mse": MSELoss(),
     }
     return losses[name]
 
@@ -53,12 +67,18 @@ def get_optimizer(name, parameters, lr, weight_decay):
         return optim.SGD(parameters, lr=lr, weight_decay=weight_decay)
     if name == "sgd_momentum":
         return optim.SGD(parameters, lr=lr, momentum=0.9, weight_decay=weight_decay)
+    if name == "nesterov":
+        return optim.SGD(parameters, lr=lr, momentum=0.9, nesterov=True, weight_decay=weight_decay)
+    if name == "adagrad":
+        return optim.Adagrad(parameters, lr=lr, weight_decay=weight_decay)
     if name == "rmsprop":
         return optim.RMSprop(parameters, lr=lr, weight_decay=weight_decay)
     if name == "adam":
         return optim.Adam(parameters, lr=lr, weight_decay=weight_decay)
     if name == "adamw":
         return optim.AdamW(parameters, lr=lr, weight_decay=weight_decay)
+    if name == "nadam":
+        return optim.NAdam(parameters, lr=lr, weight_decay=weight_decay)
 
 
 def get_scheduler(name, optimizer, epochs):
@@ -69,7 +89,7 @@ def get_scheduler(name, optimizer, epochs):
     return None
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch(model, loader, criterion, optimizer, device, l1=0.0):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
 
@@ -80,7 +100,15 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         optimizer.zero_grad()
         outputs = model(images)
         loss = criterion(outputs, labels)
-        loss.backward()
+
+        # L1 regularization: add l1 * sum(|w|) to the loss
+        # (L2 regularization is done by the optimizer's weight_decay)
+        if l1 > 0:
+            penalty = l1 * sum(p.abs().sum() for p in model.parameters())
+            (loss + penalty).backward()
+        else:
+            loss.backward()
+
         optimizer.step()
 
         total_loss += loss.item() * labels.size(0)
@@ -118,7 +146,7 @@ def train_model(model, loaders, config, class_to_idx, checkpoint_path, device):
     best_val_acc, best_epoch = -1.0, 0
 
     for epoch in range(1, config["epochs"] + 1):
-        train_loss, train_acc = train_one_epoch(model, loaders["Training"], criterion, optimizer, device)
+        train_loss, train_acc = train_one_epoch(model, loaders["Training"], criterion, optimizer, device, config["l1"])
         val_loss, val_acc = evaluate(model, loaders["Validation"], criterion, device)
 
         if scheduler is not None:
@@ -154,7 +182,7 @@ def train_model(model, loaders, config, class_to_idx, checkpoint_path, device):
 def run_experiment(name, config, saved_splits, data_dir, checkpoint_dir, results_dir, device="cuda"):
     """here we train one model and save its best checkpoint (.pt) and results (.json) to Drive
     If the results file already exists the experiment is skipped,
-    so a notebook can be re-run after Colab disconnects"""
+    so a notebook can be re-run after Colab disconnects."""
 
     config = {**DEFAULT_CONFIG, **config}
 
@@ -173,11 +201,17 @@ def run_experiment(name, config, saved_splits, data_dir, checkpoint_dir, results
     loaders, class_to_idx = create_dataloaders(
         saved_splits, data_dir,
         batch_size=config["batch_size"],
-        augment=config["augment"]
+        augment=config["augment"],
+        normalize=config["normalize"]
     )
 
     model = build_model(config["model"], len(class_to_idx),
-                        dropout=config["dropout"], **config["model_kwargs"]).to(device)
+                        dropout=config["dropout"], **config["model_kwargs"])
+
+    if config["init"]:
+        init_weights(model, config["init"])
+
+    model = model.to(device)
 
     print("=" * 70)
     print(f"Running: {name} | parameters: {count_parameters(model):,}")

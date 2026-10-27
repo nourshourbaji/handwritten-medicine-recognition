@@ -36,8 +36,8 @@ def preprocess_image(image_path, target_size=TARGET_SIZE):
     return padded
 
 
-def get_train_transform():
-    return transforms.Compose([
+def get_train_transform(normalize=None):
+    steps = [
         transforms.RandomRotation(
             degrees=5,
             fill=(255, 255, 255)
@@ -49,7 +49,13 @@ def get_train_transform():
             fill=(255, 255, 255)
         ),
         transforms.ToTensor()
-    ])
+    ]
+
+    # normalize = [mean, std] -> standardize each channel: (x - mean) / std
+    if normalize:
+        steps.append(transforms.Normalize(*normalize))
+
+    return transforms.Compose(steps)
 
 
 def get_eval_transform():

@@ -1,15 +1,38 @@
 import torch.nn as nn
 
 
-# Activation functions we compare in the experiments
+# Activation functions we compare in the experiments (Lecture 04)
 ACTIVATIONS = {
     "relu": nn.ReLU,
     "leaky_relu": nn.LeakyReLU,
     "elu": nn.ELU,
     "gelu": nn.GELU,
     "tanh": nn.Tanh,
+    "sigmoid": nn.Sigmoid,
 }
 
+def conv_blocks(channels, activation="relu", batch_norm=False, pooling="max"):
+    """Conv 3x3 -> (BatchNorm) -> Activation -> Pool, once for each value in channels.
+    Every block halves the image size."""
+    layers = []
+    in_channels = 3
+
+    for out_channels in channels:
+        layers.append(nn.Conv2d(in_channels, out_channels, 3, padding=1))
+
+        if batch_norm:
+            layers.append(nn.BatchNorm2d(out_channels))
+
+        layers.append(ACTIVATIONS[activation]())
+
+        if pooling == "max":
+            layers.append(nn.MaxPool2d(2))
+        else:
+            layers.append(nn.AvgPool2d(2))
+
+        in_channels = out_channels
+
+    return nn.Sequential(*layers)
 
 class BaselineCNN(nn.Module):
     ''' a small network (two conv layers followed by fully connected layers)'''
@@ -41,36 +64,15 @@ class BaselineCNN(nn.Module):
 
 
 class CNN(nn.Module):
-    """ a deeper CNN that we can change through its arguments
-
-    Each block is: Conv 3x3 -> (BatchNorm) -> Activation -> Pool
-    Every block halves the image size, so 5 blocks: 224 -> 7
-    """
+    """Steps 2-5: a deeper CNN that we can change through its arguments.
+    5 blocks: 224 -> 112 -> 56 -> 28 -> 14 -> 7."""
 
     def __init__(self, num_classes=78, channels=(32, 64, 128, 256, 256),
                  activation="relu", batch_norm=False, pooling="max",
                  dropout=0.0):
         super().__init__()
 
-        layers = []
-        in_channels = 3
-
-        for out_channels in channels:
-            layers.append(nn.Conv2d(in_channels, out_channels, 3, padding=1))
-
-            if batch_norm:
-                layers.append(nn.BatchNorm2d(out_channels))
-
-            layers.append(ACTIVATIONS[activation]())
-
-            if pooling == "max":
-                layers.append(nn.MaxPool2d(2))
-            else:
-                layers.append(nn.AvgPool2d(2))
-
-            in_channels = out_channels
-
-        self.features = nn.Sequential(*layers)
+        self.features = conv_blocks(channels, activation, batch_norm, pooling)
 
         # Global average pooling: one number per feature map,
         # so the classifier needs far fewer weights than flattening
@@ -78,7 +80,7 @@ class CNN(nn.Module):
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Dropout(dropout),
-            nn.Linear(in_channels, num_classes)
+            nn.Linear(channels[-1], num_classes)
         )
 
     def forward(self, x):
@@ -150,16 +152,72 @@ class SmallResNet(nn.Module):
         x = self.classifier(x)
         return x
 
+class CNNRNN(nn.Module):
+    """CNN + bidirectional RNN (Lecture 07)
+
+    A handwritten word is read from left to right, so we turn the CNN
+    feature maps into a sequence of columns and let an LSTM or GRU read it
+    in both directions (bidirectional RNN).
+    4 blocks: 224 -> 14, so the sequence has 14 steps of 256 features.
+    """
+
+    def __init__(self, num_classes=78, channels=(32, 64, 128, 256),
+                 activation="relu", rnn="lstm", hidden_size=128, dropout=0.0):
+        super().__init__()
+
+        self.features = conv_blocks(channels, activation, batch_norm=True)
+
+        if rnn == "lstm":
+            self.rnn = nn.LSTM(channels[-1], hidden_size, batch_first=True, bidirectional=True)
+        else:
+            self.rnn = nn.GRU(channels[-1], hidden_size, batch_first=True, bidirectional=True)
+
+        self.dropout = nn.Dropout(dropout)
+
+        # forward + backward final hidden states are concatenated
+        self.fc = nn.Linear(2 * hidden_size, num_classes)
+
+    def forward(self, x):
+        x = self.features(x)        # B x C x H x W
+        x = x.mean(dim=2)           # average over height -> B x C x W
+        x = x.permute(0, 2, 1)      # B x W x C: a sequence of W columns, left to right
+
+        _, hidden = self.rnn(x)
+        if isinstance(hidden, tuple):   # LSTM returns (hidden state, cell state)
+            hidden = hidden[0]
+
+        # hidden: 2 x B x hidden_size (last state of the forward and the backward direction)
+        x = torch.cat([hidden[0], hidden[1]], dim=1)
+        x = self.fc(self.dropout(x))
+        return x
+
 
 MODELS = {
     "baseline": BaselineCNN,
     "cnn": CNN,
     "resnet": SmallResNet,
+    "cnn_rnn": CNNRNN,
 }
 
 
 def build_model(name, num_classes, dropout=0.0, **model_kwargs):
     return MODELS[name](num_classes=num_classes, dropout=dropout, **model_kwargs)
+
+
+def init_weights(model, method):
+    """Weight initialization methods from Lecture 04.
+    PyTorch's default (used when method is None) is a Kaiming uniform variant."""
+    for layer in model.modules():
+        if isinstance(layer, (nn.Conv2d, nn.Linear)):
+            if method == "zero":
+                nn.init.zeros_(layer.weight)
+            elif method == "random":
+                nn.init.normal_(layer.weight, mean=0.0, std=0.01)
+            elif method == "xavier":
+                nn.init.xavier_normal_(layer.weight)
+            elif method == "he":
+                nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+            nn.init.zeros_(layer.bias)
 
 
 def count_parameters(model):
