@@ -136,6 +136,35 @@ def evaluate(model, loader, criterion, device):
     return total_loss / total, correct / total
 
 
+@torch.no_grad()
+def recalibrate_batchnorm(model, loader, device):
+    """Recompute the BatchNorm running mean/variance with the weights of this epoch.
+
+    During training BatchNorm normalizes with the statistics of each batch, but in
+    model.eval() it uses running averages collected during training. On our almost
+    white images these averages did not match the final weights (validation accuracy
+    25% with them vs 87% with batch statistics), so after every epoch we reset them
+    and compute them again with one pass over the training set.
+    """
+    model.train()
+
+    # Only BatchNorm layers that are training. The frozen stages of TransferModel
+    # stay in eval mode, so their ImageNet statistics are kept.
+    bn_layers = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d) and m.training]
+    if not bn_layers:
+        return
+
+    for bn in bn_layers:
+        bn.reset_running_stats()
+        bn.momentum = None   # exact average over all batches instead of a moving average
+
+    for images, _ in loader:
+        model(images.to(device))
+
+    for bn in bn_layers:
+        bn.momentum = 0.1    # back to the PyTorch default for the next epoch
+
+
 def train_model(model, loaders, config, class_to_idx, checkpoint_path, device):
     criterion = get_criterion(config["loss"])
     if hasattr(model, "parameter_groups"):
@@ -162,6 +191,7 @@ def train_model(model, loaders, config, class_to_idx, checkpoint_path, device):
 
     for epoch in range(1, config["epochs"] + 1):
         train_loss, train_acc = train_one_epoch(model, loaders["Training"], criterion, optimizer, device, config["l1"])
+        recalibrate_batchnorm(model, loaders["Training"], device)
         val_loss, val_acc = evaluate(model, loaders["Validation"], criterion, device)
 
         if scheduler is not None:
