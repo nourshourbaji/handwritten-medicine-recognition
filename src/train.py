@@ -138,8 +138,23 @@ def evaluate(model, loader, criterion, device):
 
 def train_model(model, loaders, config, class_to_idx, checkpoint_path, device):
     criterion = get_criterion(config["loss"])
-    optimizer = get_optimizer(config["optimizer"], model.parameters(),
-                              config["lr"], config["weight_decay"])
+    if hasattr(model, "parameter_groups"):
+        parameters = model.parameter_groups(
+            lr=config["lr"],
+            backbone_lr_mult=config.get(
+                "backbone_lr_mult", 0.1
+            )
+        )
+    
+    else:
+        parameters = model.parameters()
+    
+    optimizer = get_optimizer(
+        config["optimizer"],
+        parameters,
+        config["lr"],
+        config["weight_decay"]
+    )
     scheduler = get_scheduler(config["scheduler"], optimizer, config["epochs"])
 
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
@@ -179,11 +194,12 @@ def train_model(model, loaders, config, class_to_idx, checkpoint_path, device):
     return history, best_val_acc, best_epoch
 
 
-def run_experiment(name, config, saved_splits, data_dir, checkpoint_dir, results_dir, device="cuda"):
+def run_experiment(name, config, saved_splits, data_dir, checkpoint_dir, results_dir, device=None):
     """here we train one model and save its best checkpoint (.pt) and results (.json) to Drive
     If the results file already exists the experiment is skipped,
     so a notebook can be re-run after Colab disconnects."""
-
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     config = {**DEFAULT_CONFIG, **config}
 
     Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
@@ -208,9 +224,19 @@ def run_experiment(name, config, saved_splits, data_dir, checkpoint_dir, results
     model = build_model(config["model"], len(class_to_idx),
                         dropout=config["dropout"], **config["model_kwargs"])
 
-    if config["init"]:
-        init_weights(model, config["init"])
+    if config["init"] is not None:
 
+        if (
+            config["model"] == "transfer"
+            and config["model_kwargs"].get("pretrained", True)
+        ):
+            raise ValueError(
+                "Cannot initialize a pretrained model. "
+                "Set init=None to preserve ImageNet weights."
+            )
+
+        init_weights(model, config["init"])
+    
     model = model.to(device)
 
     print("=" * 70)
