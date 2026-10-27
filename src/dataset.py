@@ -40,7 +40,8 @@ def create_dataloaders(
     root_dir,
     batch_size=32,
     num_workers=2,
-    augment=True
+    augment=True,
+    normalize=None
 ):
     # One mapping shared by all three datasets
     class_names = sorted(
@@ -51,6 +52,7 @@ def create_dataloaders(
         name: idx
         for idx, name in enumerate(class_names)
     }
+
 
     datasets = {
         "Training": MedicineDataset(
