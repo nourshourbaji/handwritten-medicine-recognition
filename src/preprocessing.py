@@ -58,7 +58,14 @@ def get_train_transform(normalize=None):
     return transforms.Compose(steps)
 
 
-def get_eval_transform():
-    return transforms.Compose([
+def get_eval_transform(normalize=None):
+    steps = [
         transforms.ToTensor()
-    ])
+    ]
+
+    if normalize is not None:
+        steps.append(
+            transforms.Normalize(*normalize)
+        )
+
+    return transforms.Compose(steps)
