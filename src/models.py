@@ -1,4 +1,6 @@
+import torch
 import torch.nn as nn
+from torchvision import models as tv_models
 
 
 # Activation functions we compare in the experiments (Lecture 04)
@@ -191,12 +193,190 @@ class CNNRNN(nn.Module):
         x = self.fc(self.dropout(x))
         return x
 
+# ===========================================================================
+# Transfer learning: pretrained ImageNet backbones
+# ===========================================================================
+
+# Pretrained weights expect ImageNet-normalized pixels. Our pipeline does the
+# normalization (config key "normalize" = [mean, std]), so build the experiment
+# config with transfer_config() below: it sets this for you.
+IMAGENET_NORM = [(0.485, 0.456, 0.406), (0.229, 0.224, 0.225)]
+
+TRANSFER_BACKBONES = ("resnet18", "resnet50", "efficientnet_b0", "vgg16")
+
+
+def split_backbone(name, pretrained=True):
+    """Load a torchvision backbone and cut it into stages.
+
+    Returns (stages, feature_dim). stages is a list of modules ordered from
+    shallow (edges, strokes) to deep (abstract shapes), so "unfreeze the last 2
+    stages" means the 2 deepest. The original ImageNet classifier is thrown away.
+    """
+    if name not in TRANSFER_BACKBONES:
+        raise ValueError(f"Unknown backbone '{name}'. Choose from {TRANSFER_BACKBONES}")
+
+    net = tv_models.get_model(name, weights="DEFAULT" if pretrained else None)
+
+    if name.startswith("resnet"):
+        feature_dim = net.fc.in_features
+        stem = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool)
+        stages = [stem, net.layer1, net.layer2, net.layer3, net.layer4]
+
+    elif name.startswith("efficientnet"):
+        feature_dim = net.classifier[1].in_features
+        stages = list(net.features.children())   # stem, 7 MBConv stages, final 1x1 conv
+
+    else:  # vgg16: cut the conv stack after each max-pool -> 5 conv blocks
+        feature_dim = 512
+        stages, current = [], []
+        for layer in net.features:
+            current.append(layer)
+            if isinstance(layer, nn.MaxPool2d):
+                stages.append(nn.Sequential(*current))
+                current = []
+
+    return stages, feature_dim
+
+
+class TransferModel(nn.Module):
+    """Pretrained backbone + a new head (Dropout -> Linear).
+
+    unfreeze chooses which part of the backbone learns:
+        0      only the new head learns          (feature extraction)
+        n      the head + the n deepest stages   (partial fine-tuning)
+        "all"  everything learns                 (full fine-tuning)
+
+    pretrained=False keeps the same architecture with random weights: the
+    control experiment that shows what the pretrained weights bring.
+    """
+
+    def __init__(self, num_classes=78, backbone="resnet18", pretrained=True,
+                 unfreeze=2, dropout=0.0):
+        super().__init__()
+
+        stages, feature_dim = split_backbone(backbone, pretrained)
+
+        self.stages = nn.ModuleList(stages)
+        self.pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten())
+        self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(feature_dim, num_classes))
+
+        # Freezing random weights makes no sense, so a from-scratch model always learns everything
+        self.set_trainable(unfreeze if pretrained else "all")
+
+    def forward(self, x):
+        for stage in self.stages:
+            x = stage(x)
+        return self.head(self.pool(x))
+
+    def set_trainable(self, unfreeze):
+        """Freeze everything, then unfreeze the head and the `unfreeze` deepest stages."""
+        n_total = len(self.stages)
+        n = n_total if unfreeze == "all" else max(0, min(int(unfreeze), n_total))
+
+        for p in self.parameters():
+            p.requires_grad = False
+        for p in self.head.parameters():
+            p.requires_grad = True
+        for stage in list(self.stages)[n_total - n:]:     # n = 0 -> empty list
+            for p in stage.parameters():
+                p.requires_grad = True
+
+    def parameter_groups(self, lr, backbone_lr_mult=0.1):
+        """Discriminative learning rates: head gets lr, backbone gets lr * backbone_lr_mult.
+
+        The head starts random and has to move fast. The backbone already holds good
+        features and only needs gentle adjustments. Frozen weights are left out.
+        """
+        backbone = [p for s in self.stages for p in s.parameters() if p.requires_grad]
+        groups = [{"params": list(self.head.parameters()), "lr": lr}]
+        if backbone:
+            groups.append({"params": backbone, "lr": lr * backbone_lr_mult})
+        return groups
+
+    def train(self, mode=True):
+        """Keep the BatchNorm layers of FROZEN stages in eval mode.
+
+        model.train() normally lets BatchNorm update its running mean/variance even
+        when its weights are frozen. With ~3k images that would slowly overwrite the
+        ImageNet statistics. Frozen stage => frozen statistics.
+        """
+        super().train(mode)
+        if mode:
+            for stage in self.stages:
+                if not any(p.requires_grad for p in stage.parameters()):
+                    stage.eval()
+        return self
+
+
+def transfer_config(
+    backbone="resnet18",
+    unfreeze=2,
+    pretrained=True,
+    **overrides
+):
+    """
+    Create a configuration for transfer learning experiments.
+
+    backbone:
+        Pretrained architecture.
+
+    unfreeze:
+        0 = feature extraction
+        2 = fine-tune the last two stages
+        "all" = full fine-tuning
+
+    pretrained:
+        Whether to initialize with ImageNet weights.
+    """
+
+    config = {
+        "model": "transfer",
+
+        "model_kwargs": {
+            "backbone": backbone,
+            "pretrained": pretrained,
+            "unfreeze": unfreeze if pretrained else "all",
+        },
+
+        "init": None,
+
+        "normalize": IMAGENET_NORM,
+
+        "dropout": 0.3,
+
+        "loss": "cross_entropy",
+
+        "optimizer": "adamw",
+
+        "lr": 1e-3,
+
+        "backbone_lr_mult": 0.1 if pretrained else 1.0,
+
+        "weight_decay": 1e-4,
+
+        "scheduler": "cosine",
+
+        "epochs": 20,
+
+        "batch_size": 32,
+
+        "augment": True,
+
+        "patience": 5,
+
+        "seed": 42,
+    }
+
+    config.update(overrides)
+
+    return config
 
 MODELS = {
     "baseline": BaselineCNN,
     "cnn": CNN,
     "resnet": SmallResNet,
     "cnn_rnn": CNNRNN,
+    "transfer": TransferModel,
 }
 
 

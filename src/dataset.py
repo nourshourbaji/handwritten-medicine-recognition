@@ -59,21 +59,25 @@ def create_dataloaders(
             saved_splits["Training"],
             root_dir,
             class_to_idx,
-            transform=get_train_transform() if augment else get_eval_transform()
+            transform=(
+                get_train_transform(normalize=normalize)
+                if augment
+                else get_eval_transform(normalize=normalize)
+            )
         ),
 
         "Validation": MedicineDataset(
             saved_splits["Validation"],
             root_dir,
             class_to_idx,
-            transform=get_eval_transform()
+            transform=get_eval_transform(normalize=normalize)
         ),
 
         "Testing": MedicineDataset(
             saved_splits["Testing"],
             root_dir,
             class_to_idx,
-            transform=get_eval_transform()
+            transform=get_eval_transform(normalize=normalize)
         )
     }
 
