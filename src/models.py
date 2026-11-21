@@ -397,7 +397,8 @@ def init_weights(model, method):
                 nn.init.xavier_normal_(layer.weight)
             elif method == "he":
                 nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
-            nn.init.zeros_(layer.bias)
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
 
 
 def count_parameters(model):
